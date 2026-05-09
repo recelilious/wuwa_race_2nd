@@ -4,6 +4,22 @@
 
 项目目标不是复刻游戏画面，而是把赛道、团子顺序、团子技能和随机事件抽象为可重复运行的规则模型，然后通过大量随机模拟估计各团子的胜率。当前实现包含 CPU 后端和 CUDA 后端，适合从小样本规则检查一路跑到大规模概率收敛统计。
 
+## 环境要求
+
+基础 CPU 版本需要：
+
+- CMake 3.24 或更高版本。
+- 支持 C++20 的编译器。
+- Windows 下推荐 Visual Studio 2022 / MSVC；其他平台可使用兼容的 C++20 工具链自行构建。
+
+CUDA 版本额外需要：
+
+- NVIDIA CUDA Toolkit。
+- 支持 CUDA 的 NVIDIA 显卡。
+- 与当前 CUDA Toolkit 兼容的主机编译器。
+
+当前 CMake 默认 CUDA 架构为 `89`，适合 RTX 40 系 Ada Lovelace 显卡；如果使用其他显卡，可能需要调整 `CMakeLists.txt` 中的 `CUDA_ARCHITECTURES`。
+
 ## 快速启动
 
 ### CPU 构建
