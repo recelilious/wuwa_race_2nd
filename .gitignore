@@ -1,0 +1,73 @@
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Testing/
+
+# Visual Studio generated files
+.vs/
+*.sln.docstates
+*.user
+*.userosscache
+*.suo
+*.vcxproj.user
+*.VC.db
+*.VC.VC.opendb
+ipch/
+x64/
+x86/
+Win32/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+
+# C/C++/CUDA build artifacts
+*.obj
+*.o
+*.lo
+*.la
+*.lib
+*.a
+*.dll
+*.exe
+*.exp
+*.ilk
+*.pdb
+*.idb
+*.pch
+*.res
+*.tlog
+*.recipe
+*.cache
+*.deps
+*.ptx
+*.cubin
+*.fatbin
+
+# Runtime outputs
+traces/
+*.wtrace
+*.log
+
+# Local scratch files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
