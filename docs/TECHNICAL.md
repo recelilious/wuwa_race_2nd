@@ -1,4 +1,4 @@
-# 小团快跑模拟器技术文档
+﻿# 小团快跑模拟器技术文档
 
 本文档描述项目结构、构建方式、命令行参数、输入输出文件格式和扩展入口。
 
@@ -121,6 +121,7 @@ CPU 示例：
 | `--threads N` | 正整数 | CPU 线程数；`0` 或不指定时使用硬件并发数；CUDA 后端忽略 |
 | `--map PATH` | 文件路径 | 载入地图数组文件 |
 | `--names PATH` | 文件路径 | 载入显示名称文件，每行一个团子名 |
+| `--runners IDS` | 逗号或空格分隔的编号 | 指定 6 个普通参赛团子，例如 `6,7,8,9,10,11` |
 | `--start-index N` | 0-based 下标 | 覆盖起点位置 |
 | `--trace-out PATH` | 目录或文件路径 | 启用 CPU 轨迹抽样输出 |
 | `--trace-sample-percent P` | 百分数 | 轨迹抽样概率，例如 `1` 表示 1% |
@@ -141,12 +142,13 @@ CPU 示例：
 ```text
 Backend: CUDA
 Scenario: .\data\example_track.txt
+Race mode: double-round (31 -> 63)
 Simulations: 100000000
 
 Seed: 2678569521 (auto)
 
-Rank  Runner                            Wins        Win%
-1     runner_0_lu_hesi              27137998     27.138%
+Rank  Runner                            Wins        Win%      P1%      P2%      P3%      P4%      P5%      P6%
+1     runner_0_lu_hesi              27137998     27.138%  27.138%  18.250%  15.900%  14.100%  12.400%  12.212%
 ...
 ```
 
@@ -154,12 +156,14 @@ Rank  Runner                            Wins        Win%
 
 - `Backend`: 使用的计算后端。
 - `Scenario`: 场景名称；使用 `--map` 时显示地图路径。
+- `Race mode`: 仅双半场地图输出，括号里是上半场终点和下半场终点的 0-based 下标。
 - `Simulations`: 实际模拟场数。
 - `Seed`: 实际使用的随机种子。
   - `(auto)` 表示自动生成。
   - `(explicit)` 表示来自 `--seed`。
 - `Wins`: 该团子成为胜者的次数。
 - `Win%`: 胜场除以模拟总场数。
+- `P1%..PN%`: 该团子获得第 1 名到第 N 名的概率；N 为普通团子数量，不包含布大王。
 
 若想复现某次结果，把输出里的 seed 填回 `--seed`：
 
@@ -217,14 +221,35 @@ Rank  Runner                            Wins        Win%
 - 地图长度不能超过 256。
 - 每个数字必须在 `0..4`。
 - 最后一个数字必须是 `4`。
+- 地图可以有一个或两个 `4`；超过两个会报错。
 
 载入地图后：
 
 - `trackLength = 数组长度`。
-- `finishIndex = 数组最后一格下标`。
+- 若只有一个 `4`，按单场比赛模拟，`finishIndex` 为该终点下标。
+- 若有两个 `4`，按上下半场模拟：第一个 `4` 是上半场终点，最后一个 `4` 是下半场终点；下半场中第一个 `4` 不再作为胜利目标。
 - `startIndex = 0`，除非再用 `--start-index` 覆盖。
 
-## 10. 名称文件格式
+## 10. 参赛团子编号
+
+`--runners` 接受 6 个内置团子编号，顺序就是本次模拟的普通团子编号 `0..5` 对应关系。布大王仍自动作为额外实体加入，不需要写进参数。
+
+| 编号 | 团子 | 当前实现 |
+| --- | --- | --- |
+| `0` | 陆·赫斯 | 触发推进额外 +3；触发阻遏额外 -1 |
+| `1` | 西格莉卡 | 投骰后标记排名紧邻且更高的至多两个团子，使其本回合移动 -1，最低为 1 |
+| `2` | 达妮娅 | 若本次点数和上次相同，额外前进 2 |
+| `3` | 绯雪 | 与布大王相遇后，之后每次移动额外 +1 |
+| `4` | 卡提希娅 | 每场最多一次，移动后若处于最后一名，之后每回合 60% 概率额外 +2 |
+| `5` | 菲比 | 移动后 50% 概率额外前进 1 |
+| `6` | 千咲 | 若本轮骰子点数为所有普通团子本轮点数最小之一，额外前进 2 |
+| `7` | 莫宁 | 骰子固定按 3/2/1 循环出现 |
+| `8` | 琳奈 | 每回合投骰后，20% 概率本回合无法移动，否则 60% 概率按双倍点数移动 |
+| `9` | 爱弥斯 | 每场一次，经过赛程中点后，若前方有其他非布大王团子，传送到最近团子顶端 |
+| `10` | 守岸人 | 骰子只会掷出 2 或 3 |
+| `11` | 珂莱塔 | 28% 概率以骰子的双倍点数前进 |
+
+## 11. 名称文件格式
 
 名称文件每行对应一个普通团子显示名：
 
@@ -232,7 +257,7 @@ Rank  Runner                            Wins        Win%
 LuHesi
 Xigelika
 Daniya
-Weixue
+Feixue
 Katixiya
 Feibi
 ```
@@ -249,7 +274,7 @@ Feibi
 .\build-cuda\Release\wuwa_race_sim.exe --map .\runtime\map1.txt --names .\data\example_names.txt --sims 100000000 --cuda
 ```
 
-## 11. 轨迹抽样
+## 12. 轨迹抽样
 
 轨迹功能只支持 CPU 后端。
 
@@ -270,7 +295,7 @@ Feibi
 
 CUDA 后端不支持轨迹；使用 `--cuda --trace-out` 会报错。
 
-## 12. 轨迹文件格式
+## 13. 轨迹文件格式
 
 轨迹文件使用压缩文本格式，头部示例：
 
@@ -287,7 +312,7 @@ DATA
 - `WRTRACE 1`: 文件版本。
 - `N runnerCount entityCount trackLength budaFlag`。
 - `TRACK`: 赛道格子编号串。
-- `RUNNERS`: 普通团子编号列表。
+- `RUNNERS`: 普通团子的内置目录编号列表；轨迹行里的行动实体编号仍使用本场内部编号。
 - `DATA`: 后续每行是一场被抽样到的比赛。
 
 每场比赛一行：
@@ -297,7 +322,7 @@ winner|order|rounds
 ```
 
 - `winner`: 两位十六进制胜者编号。
-- `order`: 每两个十六进制字符表示一个行动顺序里的团子编号。
+- `order`: 每两个十六进制字符表示一个行动顺序里的实体编号；启用布大王时会包含编号 `runnerCount`。
 - `rounds`: 多个回合，用 `;` 分隔。
 
 每个回合：
@@ -320,7 +345,7 @@ startState>moveEvent>moveEvent...
 - 第 5 到 6 个字符：`move + 128`。
 - 后面紧跟移动后的状态编码。
 
-## 13. 轨迹解码
+## 14. 轨迹解码
 
 使用 `wuwa_trace_decode.exe`：
 
@@ -335,7 +360,7 @@ startState>moveEvent>moveEvent...
 - `P1` 表示棋盘第 1 个位置；解码器会把内部 0-based 下标显示为 1-based。
 - `#0`、`#1` 等表示堆叠深度，数字越大越靠上。
 
-## 14. 随机数和复现
+## 15. 随机数和复现
 
 主程序中：
 
@@ -357,7 +382,7 @@ CUDA 后端：
 - 默认运行适合多次独立抽样。
 - 指定 `--seed` 适合复现某一次结果。
 
-## 15. CPU 后端说明
+## 16. CPU 后端说明
 
 CPU 后端入口是：
 
@@ -374,7 +399,7 @@ SimulationResult runCpuSimulation(const Scenario& scenario, const SimulationOpti
 
 CPU 后端会先把总模拟场数平均分给每个线程，最后合并每个线程的胜场统计。
 
-## 16. CUDA 后端说明
+## 17. CUDA 后端说明
 
 CUDA 后端入口是：
 
@@ -387,7 +412,8 @@ SimulationResult runCudaSimulation(const Scenario& scenario, const SimulationOpt
 - 支持高速胜场统计。
 - 不支持轨迹输出。
 - 赛道和技能配置会复制到 CUDA constant memory。
-- 每个 GPU 线程模拟多场比赛，并在本地累积胜场后写回全局胜场数组。
+- 每个 GPU 线程模拟多场比赛；每个 CUDA block 在 shared memory 中累积名次矩阵，block 结束时再写回全局名次矩阵。
+- CUDA kernel 发射块数上限为 `SM 数量 * 8`，常规小规模比赛的 device stack 设为 4096 字节，超过 8 个普通团子时设为 8192 字节。
 
 当前 CUDA 后端限制：
 
@@ -396,17 +422,18 @@ SimulationResult runCudaSimulation(const Scenario& scenario, const SimulationOpt
 - 每个团子的技能数量不能超过 16。
 - 不支持 `--trace-out`。
 
-## 17. 如何新增或修改团子
+## 18. 如何新增或修改团子
 
-主要修改位置是 `src/scenario.cpp`。
+主要修改位置是 `src/scenario.cpp`。当前内置团子由 `makeRunner(id)` 维护，命令行 `--runners` 会调用 `setScenarioRunners` 把外部编号映射成本场内部编号 `0..5`。
 
 常见步骤：
 
-1. 修改 `runnerCount`。
-2. 设置 `runners[i].name`。
-3. 给 `runners[i].effects` 添加 `EffectRule`。
-4. 若现有 `EffectOp` 能表达新技能，优先组合现有操作。
-5. 若不能表达，需要在 `include/wuwa/race.hpp` 中新增 `EffectOp`，然后分别在 `src/sim_cpu.cpp` 和 `src/sim_cuda.cu` 的 `applyEffects` 逻辑中实现。
+1. 在 `makeRunner(id)` 中新增一个编号分支。
+2. 设置 `Runner::name` 和 `Runner::catalogId`。
+3. 如果只是改骰子，设置 `diceMin/diceMax` 或 `diceCycle/diceCycleLength`。
+4. 如果是移动或触发技能，给 `effects` 添加 `EffectRule`。
+5. 若现有 `EffectOp` 能表达新技能，优先组合现有操作。
+6. 若不能表达，需要在 `include/wuwa/race.hpp` 中新增 `EffectOp`，然后分别在 `src/sim_cpu.cpp` 和 `src/sim_cuda.cu` 的 `applyEffects` 逻辑中实现。
 
 新增技能时要同时考虑：
 
@@ -415,7 +442,7 @@ SimulationResult runCudaSimulation(const Scenario& scenario, const SimulationOpt
 - 触发时机是否已经在行动流程中调用。
 - 是否需要轨迹记录额外信息。
 
-## 18. 如何修改赛道
+## 19. 如何修改赛道
 
 简单改赛道推荐使用地图文件：
 
@@ -437,7 +464,7 @@ s.track[index] = Tile{TileType::Advance, 2, -1};
 
 当前 `Tile::target` 字段存在，但规则实现里没有使用。
 
-## 19. 如何调整默认规则参数
+## 20. 如何调整默认规则参数
 
 在 `src/scenario.cpp` 中可以调整：
 
@@ -455,9 +482,9 @@ s.track[index] = Tile{TileType::Advance, 2, -1};
 | `budaStartRound` | 布大王开始行动回合 |
 | `budaDiceMin` / `budaDiceMax` | 布大王骰子范围 |
 
-使用 `--map` 会覆盖赛道长度、终点位置和起点位置。
+使用 `--map` 会覆盖赛道长度、终点位置和起点位置；若地图含两个 `4`，还会启用双半场模式。
 
-## 20. 性能建议
+## 21. 性能建议
 
 CUDA 后端适合大规模统计，例如 `100000000` 到 `1000000000` 场。
 
@@ -468,10 +495,8 @@ CUDA 后端适合大规模统计，例如 `100000000` 到 `1000000000` 场。
 - CUDA 后端使用 `--progress-interval` 时，把间隔设置得较大，例如几亿场一次。
 - 不要在 CUDA 大规模统计时开启轨迹；当前也不支持。
 
-## 21. 已知注意事项
+## 22. 已知注意事项
 
 - `README.md` 早期内容可能存在编码乱码，建议以后以 `docs/RULES.md` 和 `docs/TECHNICAL.md` 为准。
 - Windows 终端显示中文名称时可能乱码，建议用 `--names` 文件配合 UTF-8 终端，或者使用拼音/编号。
 - 当前命令行参数解析较轻量，未知参数不会提示错误。
-- 当前统计结果只输出胜者次数和胜率，`placements` 结构里只填充了第一名统计。
-

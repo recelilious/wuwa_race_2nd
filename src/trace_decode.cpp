@@ -40,14 +40,14 @@ std::string actorName(int actor, int runnerCount, bool hasBuda) {
     return "R" + std::to_string(actor);
 }
 
-std::string decodeOrder(std::string_view text, int runnerCount) {
+std::string decodeOrder(std::string_view text, int entityCount, int runnerCount, bool hasBuda) {
     std::ostringstream out;
     out << "[";
-    for (int i = 0; i < runnerCount; ++i) {
+    for (int i = 0; i < entityCount; ++i) {
         if (i > 0) {
             out << ",";
         }
-        out << "R" << hexByte(text.substr(static_cast<std::size_t>(i) * 2, 2));
+        out << actorName(hexByte(text.substr(static_cast<std::size_t>(i) * 2, 2)), runnerCount, hasBuda);
     }
     out << "]";
     return out.str();
@@ -83,7 +83,7 @@ void decodeRaceLine(
 
     const int winner = hexByte(top[0]);
     std::cout << "Race winner=" << actorName(winner, runnerCount, hasBuda)
-              << " order=" << decodeOrder(top[1], runnerCount) << "\n";
+              << " order=" << decodeOrder(top[1], entityCount, runnerCount, hasBuda) << "\n";
 
     const auto rounds = splitView(top[2], ';');
     for (std::size_t r = 0; r < rounds.size(); ++r) {

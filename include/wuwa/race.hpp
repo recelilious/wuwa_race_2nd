@@ -11,7 +11,7 @@ inline constexpr int kMaxRunners = 18;
 inline constexpr int kMaxRaceRunners = 18;
 inline constexpr int kMaxEntities = kMaxRaceRunners + 1;
 inline constexpr int kMaxTrackTiles = 256;
-inline constexpr int kWinPlaceCount = 3;
+inline constexpr int kWinPlaceCount = kMaxRaceRunners;
 
 enum class TileType : std::uint8_t {
     Normal,
@@ -38,6 +38,7 @@ enum class EffectOp : std::uint8_t {
     AddFlatMove,
     AddRandomMove,
     AddIfSameAsPreviousRoll,
+    AddIfRoundMinRoll,
     MarkAheadPenalty,
     MoveSelf,
     MoveLeader,
@@ -45,6 +46,9 @@ enum class EffectOp : std::uint8_t {
     SkipSelfTurn,
     ActivateLastPlaceSurge,
     EnableAfterMeetingBuda,
+    MultiplyMove,
+    RollDoubleOrStop,
+    TeleportToNearestAheadAfterHalf,
 };
 
 struct Tile {
@@ -63,6 +67,11 @@ struct EffectRule {
 
 struct Runner {
     std::string name;
+    int catalogId = -1;
+    int diceMin = 0;
+    int diceMax = 0;
+    std::array<int, 6> diceCycle{};
+    int diceCycleLength = 0;
     std::vector<EffectRule> effects;
 };
 
@@ -71,12 +80,16 @@ struct Scenario {
     int runnerCount = 0;
     int trackLength = 0;
     int finishIndex = 0;
+    int firstFinishIndex = 0;
+    int secondFinishIndex = -1;
     int startIndex = 0;
     int lapsToWin = 1;
     int diceMin = 1;
     int diceMax = 3;
     bool randomizeInitialOrder = true;
     bool initialOrderIsTopToBottom = true;
+    bool doubleRound = false;
+    bool needsRoundRollPreview = false;
     bool enableBudaKing = false;
     int budaStartRound = 3;
     int budaDiceMin = 1;
@@ -106,6 +119,7 @@ struct SimulationOptions {
 };
 
 Scenario makeExampleScenario();
+void setScenarioRunners(Scenario& scenario, const std::vector<int>& catalogIds);
 void loadTrackFile(Scenario& scenario, const std::string& path);
 void loadRunnerNamesFile(Scenario& scenario, const std::string& path);
 SimulationResult runCpuSimulation(const Scenario& scenario, const SimulationOptions& options);

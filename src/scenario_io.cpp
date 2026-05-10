@@ -75,12 +75,24 @@ void loadTrackFile(Scenario& scenario, const std::string& path) {
     if (values.size() > kMaxTrackTiles) {
         throw std::runtime_error("track is longer than kMaxTrackTiles");
     }
-    if (values.back() != 4) {
+    std::vector<int> finishPositions;
+    for (int i = 0; i < static_cast<int>(values.size()); ++i) {
+        if (values[static_cast<std::size_t>(i)] == 4) {
+            finishPositions.push_back(i);
+        }
+    }
+    if (finishPositions.empty() || values.back() != 4) {
         throw std::runtime_error("track file must end with 4 (Finish)");
+    }
+    if (finishPositions.size() > 2) {
+        throw std::runtime_error("track file can contain one finish or two finishes");
     }
 
     scenario.trackLength = static_cast<int>(values.size());
-    scenario.finishIndex = scenario.trackLength - 1;
+    scenario.doubleRound = finishPositions.size() == 2;
+    scenario.firstFinishIndex = finishPositions.front();
+    scenario.secondFinishIndex = scenario.doubleRound ? finishPositions.back() : -1;
+    scenario.finishIndex = scenario.firstFinishIndex;
     scenario.startIndex = 0;
 
     for (int i = 0; i < scenario.trackLength; ++i) {

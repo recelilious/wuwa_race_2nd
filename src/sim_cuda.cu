@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -13,7 +14,10 @@ namespace {
 
 constexpr int kCudaMaxEffects = 16;
 constexpr int kThreadsPerBlock = 256;
-constexpr int kBlocksPerSm = 64;
+constexpr int kBlocksPerSm = 8;
+constexpr int kCudaSmallRunnerLimit = 8;
+constexpr std::size_t kCudaSmallThreadStackBytes = 4096;
+constexpr std::size_t kCudaLargeThreadStackBytes = 8192;
 
 struct CudaTile {
     int type = 0;
@@ -33,17 +37,25 @@ struct CudaScenario {
     int runnerCount = 0;
     int trackLength = 0;
     int finishIndex = 0;
+    int firstFinishIndex = 0;
+    int secondFinishIndex = -1;
     int startIndex = 0;
     int lapsToWin = 1;
     int diceMin = 1;
     int diceMax = 3;
     int randomizeInitialOrder = 1;
     int initialOrderIsTopToBottom = 1;
+    int doubleRound = 0;
+    int needsRoundRollPreview = 0;
     int enableBudaKing = 0;
     int budaStartRound = 3;
     int budaDiceMin = 1;
     int budaDiceMax = 6;
     CudaTile track[kMaxTrackTiles]{};
+    int runnerDiceMin[kMaxRaceRunners]{};
+    int runnerDiceMax[kMaxRaceRunners]{};
+    int runnerDiceCycleLength[kMaxRaceRunners]{};
+    int runnerDiceCycle[kMaxRaceRunners][6]{};
     int effectCount[kMaxRaceRunners]{};
     CudaEffect effects[kMaxRaceRunners][kCudaMaxEffects]{};
 };
@@ -54,15 +66,23 @@ struct DeviceRaceState {
     int progress[kMaxRaceRunners]{};
     int finishCrossings[kMaxRaceRunners]{};
     int lastRoll[kMaxRaceRunners]{};
+    int roundRoll[kMaxRaceRunners]{};
+    int diceCycleIndex[kMaxRaceRunners]{};
     int penaltyThisRound[kMaxRaceRunners]{};
     int skipTurn[kMaxRaceRunners]{};
+    int noMoveThisTurn[kMaxRaceRunners]{};
     int metBudaKing[kMaxRaceRunners]{};
     int lastPlaceSurgeActive[kMaxRaceRunners]{};
     int lastPlaceSurgeConsumed[kMaxRaceRunners]{};
+    int teleportAfterHalfConsumed[kMaxRaceRunners]{};
     int lastPlaceSurgeChance[kMaxRaceRunners]{};
     int lastPlaceSurgeAmount[kMaxRaceRunners]{};
-    int actionOrder[kMaxRaceRunners]{};
+    int actionOrder[kMaxEntities]{};
     int budaId = -1;
+    int activeFinishIndex = 0;
+    int budaHomeIndex = 0;
+    int leg = 1;
+    int roundMinRoll = 0;
 };
 
 struct DeviceRng {
@@ -94,12 +114,16 @@ CudaScenario makeCudaScenario(const Scenario& scenario) {
     out.runnerCount = scenario.runnerCount;
     out.trackLength = scenario.trackLength;
     out.finishIndex = scenario.finishIndex;
+    out.firstFinishIndex = scenario.firstFinishIndex;
+    out.secondFinishIndex = scenario.secondFinishIndex;
     out.startIndex = scenario.startIndex;
     out.lapsToWin = scenario.lapsToWin;
     out.diceMin = scenario.diceMin;
     out.diceMax = scenario.diceMax;
     out.randomizeInitialOrder = scenario.randomizeInitialOrder ? 1 : 0;
     out.initialOrderIsTopToBottom = scenario.initialOrderIsTopToBottom ? 1 : 0;
+    out.doubleRound = scenario.doubleRound ? 1 : 0;
+    out.needsRoundRollPreview = scenario.needsRoundRollPreview ? 1 : 0;
     out.enableBudaKing = scenario.enableBudaKing ? 1 : 0;
     out.budaStartRound = scenario.budaStartRound;
     out.budaDiceMin = scenario.budaDiceMin;
@@ -110,6 +134,12 @@ CudaScenario makeCudaScenario(const Scenario& scenario) {
     }
 
     for (int r = 0; r < scenario.runnerCount; ++r) {
+        out.runnerDiceMin[r] = scenario.runners[r].diceMin;
+        out.runnerDiceMax[r] = scenario.runners[r].diceMax;
+        out.runnerDiceCycleLength[r] = scenario.runners[r].diceCycleLength;
+        for (int i = 0; i < 6; ++i) {
+            out.runnerDiceCycle[r][i] = scenario.runners[r].diceCycle[static_cast<std::size_t>(i)];
+        }
         if (scenario.runners[r].effects.size() > kCudaMaxEffects) {
             throw std::runtime_error("too many effects for CUDA backend");
         }
@@ -143,6 +173,14 @@ void validateCudaScenario(const Scenario& scenario, const SimulationOptions& opt
     }
     if (scenario.finishIndex < 0 || scenario.finishIndex >= scenario.trackLength) {
         throw std::runtime_error("finishIndex is out of range");
+    }
+    if (scenario.doubleRound) {
+        if (scenario.firstFinishIndex < 0 || scenario.firstFinishIndex >= scenario.trackLength) {
+            throw std::runtime_error("firstFinishIndex is out of range");
+        }
+        if (scenario.secondFinishIndex < 0 || scenario.secondFinishIndex >= scenario.trackLength) {
+            throw std::runtime_error("secondFinishIndex is out of range");
+        }
     }
 }
 
@@ -181,6 +219,42 @@ __device__ int dRandRange(DeviceRng* rng, int lo, int hi) {
     return lo + static_cast<int>(dNextRandom(rng) % static_cast<unsigned int>(span));
 }
 
+__device__ int dRollForRunner(
+    const CudaScenario& scenario,
+    DeviceRaceState& state,
+    DeviceRng* rng,
+    int runner,
+    int consumeCycle
+) {
+    const int cycleLength = scenario.runnerDiceCycleLength[runner];
+    if (cycleLength > 0) {
+        const int index = state.diceCycleIndex[runner] % cycleLength;
+        if (consumeCycle) {
+            ++state.diceCycleIndex[runner];
+        }
+        return scenario.runnerDiceCycle[runner][index];
+    }
+
+    const int lo = scenario.runnerDiceMin[runner] > 0 ? scenario.runnerDiceMin[runner] : scenario.diceMin;
+    const int hi = scenario.runnerDiceMax[runner] >= lo ? scenario.runnerDiceMax[runner] : scenario.diceMax;
+    return dRandRange(rng, lo, hi);
+}
+
+__device__ void dPrepareRoundRolls(const CudaScenario& scenario, DeviceRaceState& state, DeviceRng* rng) {
+    state.roundMinRoll = 0;
+    for (int runner = 0; runner < scenario.runnerCount; ++runner) {
+        state.roundRoll[runner] = 0;
+        if (state.skipTurn[runner]) {
+            continue;
+        }
+        const int roll = dRollForRunner(scenario, state, rng, runner, 0);
+        state.roundRoll[runner] = roll;
+        if (state.roundMinRoll == 0 || roll < state.roundMinRoll) {
+            state.roundMinRoll = roll;
+        }
+    }
+}
+
 __device__ int dMin(int a, int b) {
     return a < b ? a : b;
 }
@@ -210,6 +284,40 @@ __device__ int dProgressGreater(const DeviceRaceState& state, int a, int b) {
         return state.progress[a] > state.progress[b];
     }
     return dStackDepth(state, a) > dStackDepth(state, b);
+}
+
+template <int LocalRunnerLimit>
+__device__ void dAccumulatePlacements(
+    const CudaScenario& scenario,
+    const DeviceRaceState& state,
+    int winner,
+    unsigned int* placements
+) {
+    unsigned int placedMask = 0;
+    int place = 0;
+    if (dIsRunner(scenario, winner)) {
+        atomicAdd(&placements[winner * LocalRunnerLimit + place], 1u);
+        placedMask |= (1u << winner);
+        ++place;
+    }
+
+    while (place < scenario.runnerCount) {
+        int best = -1;
+        for (int r = 0; r < scenario.runnerCount; ++r) {
+            if (placedMask & (1u << r)) {
+                continue;
+            }
+            if (best < 0 || dProgressGreater(state, r, best)) {
+                best = r;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        atomicAdd(&placements[best * LocalRunnerLimit + place], 1u);
+        placedMask |= (1u << best);
+        ++place;
+    }
 }
 
 __device__ int dIsLastPlace(const CudaScenario& scenario, const DeviceRaceState& state, int runner) {
@@ -251,13 +359,13 @@ __device__ void dRemoveSingle(DeviceRaceState& state, int entity, int entityCoun
     }
 }
 
-__device__ int dCountForwardFinishCrossings(const CudaScenario& scenario, int from, int steps) {
+__device__ int dCountForwardFinishCrossings(const CudaScenario& scenario, const DeviceRaceState& state, int from, int steps) {
     if (steps <= 0) {
         return 0;
     }
     int crossings = 0;
     for (int i = 1; i <= steps; ++i) {
-        if (dWrapIndex(from + i, scenario.trackLength) == scenario.finishIndex) {
+        if (dWrapIndex(from + i, scenario.trackLength) == state.activeFinishIndex) {
             ++crossings;
         }
     }
@@ -281,16 +389,80 @@ __device__ int dMoveGroup(
     const int to = dWrapIndex(from + steps, scenario.trackLength);
 
     unsigned int movedMask = 0;
-    int groupCount = 0;
     for (int e = 0; e < entityCount; ++e) {
         if (state.pos[e] == from && state.depth[e] >= baseDepth) {
             movedMask |= (1u << e);
-            ++groupCount;
         }
     }
 
+    const int budaGroup = dIsBuda(state, entity);
+    if (budaGroup) {
+        int oldPos[kMaxEntities];
+        int oldDepth[kMaxEntities];
+        for (int e = 0; e < entityCount; ++e) {
+            oldPos[e] = state.pos[e];
+            oldDepth[e] = state.depth[e];
+        }
+
+        const int direction = steps < 0 ? -1 : 1;
+        const int distance = steps < 0 ? -steps : steps;
+        for (int offset = 1; offset <= distance; ++offset) {
+            const int pathPos = dWrapIndex(from + direction * offset, scenario.trackLength);
+            for (int e = 0; e < entityCount; ++e) {
+                if (oldPos[e] == pathPos) {
+                    movedMask |= (1u << e);
+                }
+            }
+        }
+
+        for (int moved = 0; moved < entityCount; ++moved) {
+            if ((movedMask & (1u << moved)) && dIsRunner(scenario, moved)) {
+                state.progress[moved] += steps;
+                if (state.progress[moved] < 0) {
+                    state.progress[moved] = 0;
+                }
+            }
+        }
+
+        int nextDepth = 0;
+        unsigned int placedMask = 0;
+        for (int oldD = baseDepth; oldD < entityCount; ++oldD) {
+            for (int e = 0; e < entityCount; ++e) {
+                const unsigned int bit = (1u << e);
+                if ((movedMask & bit) && !(placedMask & bit) && oldPos[e] == from && oldDepth[e] == oldD) {
+                    state.pos[e] = to;
+                    state.depth[e] = nextDepth++;
+                    placedMask |= bit;
+                }
+            }
+        }
+        for (int offset = 1; offset <= distance; ++offset) {
+            const int pathPos = dWrapIndex(from + direction * offset, scenario.trackLength);
+            for (int oldD = 0; oldD < entityCount; ++oldD) {
+                for (int e = 0; e < entityCount; ++e) {
+                    const unsigned int bit = (1u << e);
+                    if ((movedMask & bit) && !(placedMask & bit) && oldPos[e] == pathPos && oldDepth[e] == oldD) {
+                        state.pos[e] = to;
+                        state.depth[e] = nextDepth++;
+                        placedMask |= bit;
+                    }
+                }
+            }
+        }
+
+        if (scenario.enableBudaKing && state.budaId >= 0) {
+            const int budaPos = state.pos[state.budaId];
+            for (int r = 0; r < scenario.runnerCount; ++r) {
+                if (state.pos[r] == budaPos) {
+                    state.metBudaKing[r] = 1;
+                }
+            }
+        }
+        return -1;
+    }
+
     if (canWin && steps > 0) {
-        const int crossings = dCountForwardFinishCrossings(scenario, from, steps);
+        const int crossings = dCountForwardFinishCrossings(scenario, state, from, steps);
         if (crossings > 0) {
             int winner = -1;
             int topDepth = -1;
@@ -304,38 +476,51 @@ __device__ int dMoveGroup(
                 }
             }
             if (winner >= 0) {
+                int destTop = -1;
+                for (int e = 0; e < entityCount; ++e) {
+                    if (!(movedMask & (1u << e))
+                        && state.pos[e] == state.activeFinishIndex
+                        && state.depth[e] > destTop) {
+                        destTop = state.depth[e];
+                    }
+                }
+                for (int moved = 0; moved < entityCount; ++moved) {
+                    if (movedMask & (1u << moved)) {
+                        const int oldDepth = state.depth[moved];
+                        state.pos[moved] = state.activeFinishIndex;
+                        state.depth[moved] = destTop + 1 + (oldDepth - baseDepth);
+                        if (dIsRunner(scenario, moved)) {
+                            state.progress[moved] += steps;
+                            if (state.progress[moved] < 0) {
+                                state.progress[moved] = 0;
+                            }
+                        }
+                    }
+                }
+                if (scenario.enableBudaKing && state.budaId >= 0) {
+                    const int budaPos = state.pos[state.budaId];
+                    for (int r = 0; r < scenario.runnerCount; ++r) {
+                        if (state.pos[r] == budaPos) {
+                            state.metBudaKing[r] = 1;
+                        }
+                    }
+                }
                 return winner;
             }
         }
     }
 
-    const int budaGroup = dIsBuda(state, entity);
-    if (budaGroup) {
-        for (int e = 0; e < entityCount; ++e) {
-            if (!(movedMask & (1u << e)) && state.pos[e] == to) {
-                state.depth[e] += groupCount;
-            }
+    int destTop = -1;
+    for (int e = 0; e < entityCount; ++e) {
+        if (!(movedMask & (1u << e)) && state.pos[e] == to && state.depth[e] > destTop) {
+            destTop = state.depth[e];
         }
-        for (int moved = 0; moved < entityCount; ++moved) {
-            if (movedMask & (1u << moved)) {
-                const int oldDepth = state.depth[moved];
-                state.pos[moved] = to;
-                state.depth[moved] = oldDepth - baseDepth;
-            }
-        }
-    } else {
-        int destTop = -1;
-        for (int e = 0; e < entityCount; ++e) {
-            if (!(movedMask & (1u << e)) && state.pos[e] == to && state.depth[e] > destTop) {
-                destTop = state.depth[e];
-            }
-        }
-        for (int moved = 0; moved < entityCount; ++moved) {
-            if (movedMask & (1u << moved)) {
-                const int oldDepth = state.depth[moved];
-                state.pos[moved] = to;
-                state.depth[moved] = destTop + 1 + (oldDepth - baseDepth);
-            }
+    }
+    for (int moved = 0; moved < entityCount; ++moved) {
+        if (movedMask & (1u << moved)) {
+            const int oldDepth = state.depth[moved];
+            state.pos[moved] = to;
+            state.depth[moved] = destTop + 1 + (oldDepth - baseDepth);
         }
     }
 
@@ -392,7 +577,7 @@ __device__ void dShuffleStackKeepingBudaAtBottom(
     }
 }
 
-__device__ void dMarkAheadPenalty(
+__device__ __noinline__ void dMarkAheadPenalty(
     const CudaScenario& scenario,
     DeviceRaceState& state,
     int runner,
@@ -433,7 +618,67 @@ __device__ void dMarkAheadPenalty(
     }
 }
 
-__device__ int dApplyEffects(
+__device__ void dUpdateBudaMeetings(const CudaScenario& scenario, DeviceRaceState& state);
+
+__device__ __noinline__ void dTeleportSingleToNearestAhead(
+    const CudaScenario& scenario,
+    DeviceRaceState& state,
+    int runner
+) {
+    if (state.teleportAfterHalfConsumed[runner]) {
+        return;
+    }
+
+    const int midpoint = dMax(1, scenario.trackLength / 2);
+    if (state.progress[runner] < midpoint) {
+        return;
+    }
+
+    int target = -1;
+    int bestDistance = 0;
+    for (int other = 0; other < scenario.runnerCount; ++other) {
+        if (other == runner) {
+            continue;
+        }
+        const int distance = state.progress[other] - state.progress[runner];
+        if (distance <= 0) {
+            continue;
+        }
+        if (target < 0 || distance < bestDistance) {
+            target = other;
+            bestDistance = distance;
+        }
+    }
+    if (target < 0) {
+        return;
+    }
+
+    state.teleportAfterHalfConsumed[runner] = 1;
+    const int entityCount = dEntityCount(scenario);
+    dRemoveSingle(state, runner, entityCount);
+    const int targetPos = state.pos[target];
+    int destTop = -1;
+    for (int e = 0; e < entityCount; ++e) {
+        if (e != runner && state.pos[e] == targetPos && state.depth[e] > destTop) {
+            destTop = state.depth[e];
+        }
+    }
+    state.pos[runner] = targetPos;
+    state.depth[runner] = destTop + 1;
+    state.progress[runner] = dMax(state.progress[runner], state.progress[target]);
+    dUpdateBudaMeetings(scenario, state);
+}
+
+__device__ __noinline__ int dResolveLandingTile(
+    const CudaScenario& scenario,
+    DeviceRaceState& state,
+    DeviceRng* rng,
+    int entity,
+    int direction,
+    int canWin
+);
+
+__device__ __noinline__ int dApplyEffects(
     const CudaScenario& scenario,
     DeviceRaceState& state,
     DeviceRng* rng,
@@ -472,6 +717,10 @@ __device__ int dApplyEffects(
             if (state.lastRoll[runner] > 0 && state.lastRoll[runner] == currentRoll) {
                 *move += effect.a;
             }
+        } else if (effect.op == static_cast<int>(EffectOp::AddIfRoundMinRoll)) {
+            if (state.roundMinRoll > 0 && currentRoll == state.roundMinRoll) {
+                *move += effect.a;
+            }
         } else if (effect.op == static_cast<int>(EffectOp::MarkAheadPenalty)) {
             dMarkAheadPenalty(scenario, state, runner, effect.a, effect.b);
         } else if (effect.op == static_cast<int>(EffectOp::MoveSelf)) {
@@ -479,15 +728,29 @@ __device__ int dApplyEffects(
             if (winner >= 0) {
                 return winner;
             }
+            const int tileWinner = dResolveLandingTile(scenario, state, rng, runner, 1, 1);
+            if (tileWinner >= 0) {
+                return tileWinner;
+            }
         } else if (effect.op == static_cast<int>(EffectOp::MoveLeader)) {
-            const int winner = dMoveGroup(scenario, state, dLeaderOf(scenario, state), effect.a, 1);
+            const int target = dLeaderOf(scenario, state);
+            const int winner = dMoveGroup(scenario, state, target, effect.a, 1);
             if (winner >= 0) {
                 return winner;
             }
+            const int tileWinner = dResolveLandingTile(scenario, state, rng, target, 1, 1);
+            if (tileWinner >= 0) {
+                return tileWinner;
+            }
         } else if (effect.op == static_cast<int>(EffectOp::MoveLast)) {
-            const int winner = dMoveGroup(scenario, state, dLastOf(scenario, state), effect.a, 1);
+            const int target = dLastOf(scenario, state);
+            const int winner = dMoveGroup(scenario, state, target, effect.a, 1);
             if (winner >= 0) {
                 return winner;
+            }
+            const int tileWinner = dResolveLandingTile(scenario, state, rng, target, 1, 1);
+            if (tileWinner >= 0) {
+                return tileWinner;
             }
         } else if (effect.op == static_cast<int>(EffectOp::SkipSelfTurn)) {
             state.skipTurn[runner] = 1;
@@ -495,12 +758,24 @@ __device__ int dApplyEffects(
             if (state.metBudaKing[runner]) {
                 *move += effect.a;
             }
+        } else if (effect.op == static_cast<int>(EffectOp::MultiplyMove)) {
+            *move *= effect.a;
+        } else if (effect.op == static_cast<int>(EffectOp::RollDoubleOrStop)) {
+            const int roll = dRandRange(rng, 1, 1000);
+            if (roll <= effect.b) {
+                *move = 0;
+                state.noMoveThisTurn[runner] = 1;
+            } else if (roll <= effect.b + effect.a) {
+                *move *= 2;
+            }
+        } else if (effect.op == static_cast<int>(EffectOp::TeleportToNearestAheadAfterHalf)) {
+            dTeleportSingleToNearestAhead(scenario, state, runner);
         }
     }
     return -1;
 }
 
-__device__ int dResolveLandingTile(
+__device__ __noinline__ int dResolveLandingTile(
     const CudaScenario& scenario,
     DeviceRaceState& state,
     DeviceRng* rng,
@@ -517,10 +792,14 @@ __device__ int dResolveLandingTile(
             return -1;
         }
         if (tile.type == static_cast<int>(TileType::Advance)) {
-            move = direction * (tile.amount == 0 ? 1 : tile.amount);
+            move = dIsBuda(state, entity)
+                ? (tile.amount == 0 ? 1 : tile.amount)
+                : direction * (tile.amount == 0 ? 1 : tile.amount);
             trigger = static_cast<int>(EffectTrigger::OnAdvanceTile);
         } else if (tile.type == static_cast<int>(TileType::Delay)) {
-            move = -direction * (tile.amount == 0 ? 1 : tile.amount);
+            move = dIsBuda(state, entity)
+                ? -(tile.amount == 0 ? 1 : tile.amount)
+                : -direction * (tile.amount == 0 ? 1 : tile.amount);
             trigger = static_cast<int>(EffectTrigger::OnDelayTile);
         } else if (tile.type == static_cast<int>(TileType::Rift)) {
             dShuffleStackKeepingBudaAtBottom(scenario, state, rng, state.pos[entity]);
@@ -554,6 +833,64 @@ __device__ void dUpdateBudaMeetings(const CudaScenario& scenario, DeviceRaceStat
     }
 }
 
+__device__ void dResetActionOrder(const CudaScenario& scenario, DeviceRaceState& state, DeviceRng* rng) {
+    const int entityCount = dEntityCount(scenario);
+    for (int i = 0; i < entityCount; ++i) {
+        state.actionOrder[i] = i;
+    }
+
+    if (scenario.randomizeInitialOrder) {
+        for (int i = entityCount - 1; i > 0; --i) {
+            const int j = dRandRange(rng, 0, i);
+            const int tmp = state.actionOrder[i];
+            state.actionOrder[i] = state.actionOrder[j];
+            state.actionOrder[j] = tmp;
+        }
+    }
+}
+
+__device__ void dBeginSecondLeg(const CudaScenario& scenario, DeviceRaceState& state, DeviceRng* rng) {
+    if (!scenario.doubleRound) {
+        return;
+    }
+
+    state.leg = 2;
+    state.activeFinishIndex = scenario.secondFinishIndex;
+    state.budaHomeIndex = scenario.secondFinishIndex;
+    state.roundMinRoll = 0;
+    for (int r = 0; r < scenario.runnerCount; ++r) {
+        state.finishCrossings[r] = 0;
+        state.lastRoll[r] = 0;
+        state.diceCycleIndex[r] = 0;
+        state.penaltyThisRound[r] = 0;
+        state.skipTurn[r] = 0;
+        state.noMoveThisTurn[r] = 0;
+        state.metBudaKing[r] = 0;
+        state.lastPlaceSurgeActive[r] = 0;
+        state.lastPlaceSurgeConsumed[r] = 0;
+        state.teleportAfterHalfConsumed[r] = 0;
+        state.lastPlaceSurgeChance[r] = 0;
+        state.lastPlaceSurgeAmount[r] = 0;
+        state.roundRoll[r] = 0;
+    }
+
+    dResetActionOrder(scenario, state, rng);
+    if (scenario.enableBudaKing && state.budaId >= 0) {
+        const int entityCount = dEntityCount(scenario);
+        const int buda = state.budaId;
+        dRemoveSingle(state, buda, entityCount);
+        for (int e = 0; e < entityCount; ++e) {
+            if (e != buda && state.pos[e] == state.budaHomeIndex) {
+                ++state.depth[e];
+            }
+        }
+        state.pos[buda] = state.budaHomeIndex;
+        state.depth[buda] = 0;
+    }
+
+    dUpdateBudaMeetings(scenario, state);
+}
+
 __device__ void dMakeInitialState(
     const CudaScenario& scenario,
     DeviceRaceState& state,
@@ -567,19 +904,34 @@ __device__ void dMakeInitialState(
         state.progress[i] = 0;
         state.finishCrossings[i] = 0;
         state.lastRoll[i] = 0;
+        state.roundRoll[i] = 0;
+        state.diceCycleIndex[i] = 0;
         state.penaltyThisRound[i] = 0;
         state.skipTurn[i] = 0;
+        state.noMoveThisTurn[i] = 0;
         state.metBudaKing[i] = 0;
         state.lastPlaceSurgeActive[i] = 0;
         state.lastPlaceSurgeConsumed[i] = 0;
+        state.teleportAfterHalfConsumed[i] = 0;
         state.lastPlaceSurgeChance[i] = 0;
         state.lastPlaceSurgeAmount[i] = 0;
-        state.actionOrder[i] = i;
     }
     state.budaId = -1;
+    state.activeFinishIndex = scenario.doubleRound ? scenario.firstFinishIndex : scenario.finishIndex;
+    state.budaHomeIndex = state.activeFinishIndex;
+    state.leg = 1;
+    state.roundMinRoll = 0;
+    if (scenario.enableBudaKing) {
+        state.budaId = scenario.runnerCount;
+    }
+
+    const int entityCount = dEntityCount(scenario);
+    for (int i = 0; i < entityCount; ++i) {
+        state.actionOrder[i] = i;
+    }
 
     if (scenario.randomizeInitialOrder) {
-        for (int i = scenario.runnerCount - 1; i > 0; --i) {
+        for (int i = entityCount - 1; i > 0; --i) {
             const int j = dRandRange(rng, 0, i);
             const int tmp = state.actionOrder[i];
             state.actionOrder[i] = state.actionOrder[j];
@@ -587,17 +939,21 @@ __device__ void dMakeInitialState(
         }
     }
 
-    for (int orderIndex = 0; orderIndex < scenario.runnerCount; ++orderIndex) {
+    int normalOrderIndex = 0;
+    for (int orderIndex = 0; orderIndex < entityCount; ++orderIndex) {
         const int runner = state.actionOrder[orderIndex];
+        if (!dIsRunner(scenario, runner)) {
+            continue;
+        }
         state.pos[runner] = scenario.startIndex;
         state.depth[runner] = scenario.initialOrderIsTopToBottom
-            ? (scenario.runnerCount - 1 - orderIndex)
-            : orderIndex;
+            ? (scenario.runnerCount - 1 - normalOrderIndex)
+            : normalOrderIndex;
+        ++normalOrderIndex;
     }
 
     if (scenario.enableBudaKing) {
-        state.budaId = scenario.runnerCount;
-        state.pos[state.budaId] = scenario.finishIndex;
+        state.pos[state.budaId] = state.budaHomeIndex;
         state.depth[state.budaId] = 0;
     }
     dUpdateBudaMeetings(scenario, state);
@@ -614,7 +970,13 @@ __device__ int dTakeRunnerTurn(
         return -1;
     }
 
-    const int roll = dRandRange(rng, scenario.diceMin, scenario.diceMax);
+    state.noMoveThisTurn[runner] = 0;
+    const int roll = state.roundRoll[runner] > 0
+        ? state.roundRoll[runner]
+        : dRollForRunner(scenario, state, rng, runner, 1);
+    if (state.roundRoll[runner] > 0 && scenario.runnerDiceCycleLength[runner] > 0) {
+        ++state.diceCycleIndex[runner];
+    }
     int move = roll;
     int winner = dApplyEffects(scenario, state, rng, runner, static_cast<int>(EffectTrigger::BeforeRoll), roll, &move);
     if (winner >= 0) {
@@ -625,16 +987,25 @@ __device__ int dTakeRunnerTurn(
         return winner;
     }
 
-    if (state.lastPlaceSurgeActive[runner] && dChanceHits(rng, state.lastPlaceSurgeChance[runner])) {
+    if (!state.noMoveThisTurn[runner]
+        && state.lastPlaceSurgeActive[runner]
+        && dChanceHits(rng, state.lastPlaceSurgeChance[runner])) {
         move += state.lastPlaceSurgeAmount[runner];
     }
-    if (state.penaltyThisRound[runner] > 0) {
+    if (!state.noMoveThisTurn[runner] && state.penaltyThisRound[runner] > 0) {
         move = dMax(1, move - state.penaltyThisRound[runner]);
     }
 
-    winner = dApplyEffects(scenario, state, rng, runner, static_cast<int>(EffectTrigger::BeforeMove), roll, &move);
-    if (winner >= 0) {
-        return winner;
+    if (!state.noMoveThisTurn[runner]) {
+        winner = dApplyEffects(scenario, state, rng, runner, static_cast<int>(EffectTrigger::BeforeMove), roll, &move);
+        if (winner >= 0) {
+            return winner;
+        }
+    }
+
+    if (state.noMoveThisTurn[runner] || move == 0) {
+        state.lastRoll[runner] = roll;
+        return -1;
     }
     winner = dMoveGroup(scenario, state, runner, move, 1);
     if (winner >= 0) {
@@ -669,11 +1040,11 @@ __device__ void dTeleportBudaToFinish(const CudaScenario& scenario, DeviceRaceSt
     const int buda = state.budaId;
     dRemoveSingle(state, buda, entityCount);
     for (int e = 0; e < entityCount; ++e) {
-        if (e != buda && state.pos[e] == scenario.finishIndex) {
+        if (e != buda && state.pos[e] == state.budaHomeIndex) {
             ++state.depth[e];
         }
     }
-    state.pos[buda] = scenario.finishIndex;
+    state.pos[buda] = state.budaHomeIndex;
     state.depth[buda] = 0;
     dUpdateBudaMeetings(scenario, state);
 }
@@ -700,60 +1071,95 @@ __device__ void dTakeBudaTurn(
     const int move = -roll;
     dMoveGroup(scenario, state, state.budaId, move, 0);
     dResolveLandingTile(scenario, state, rng, state.budaId, -1, 0);
+    dFinishBudaRound(scenario, state);
 }
 
-__device__ int dSimulateOneRace(const CudaScenario& scenario, DeviceRng* rng) {
-    DeviceRaceState state;
-    dMakeInitialState(scenario, state, rng);
-
+template <int LocalRunnerLimit>
+__device__ int dRunActiveLeg(const CudaScenario& scenario, DeviceRaceState& state, DeviceRng* rng) {
     for (int round = 1; round <= 10000; ++round) {
         for (int r = 0; r < scenario.runnerCount; ++r) {
             state.penaltyThisRound[r] = 0;
         }
-
-        if (scenario.enableBudaKing && round >= scenario.budaStartRound) {
-            dTakeBudaTurn(scenario, state, rng);
+        if (scenario.needsRoundRollPreview) {
+            dPrepareRoundRolls(scenario, state, rng);
+        } else {
+            state.roundMinRoll = 0;
+            for (int r = 0; r < scenario.runnerCount; ++r) {
+                state.roundRoll[r] = 0;
+            }
         }
 
-        for (int i = 0; i < scenario.runnerCount; ++i) {
-            const int runner = state.actionOrder[i];
-            const int winner = dTakeRunnerTurn(scenario, state, rng, runner);
+        const int entityCount = dEntityCount(scenario);
+        for (int i = 0; i < entityCount; ++i) {
+            const int entity = state.actionOrder[i];
+            if (dIsBuda(state, entity)) {
+                if (round >= scenario.budaStartRound) {
+                    dTakeBudaTurn(scenario, state, rng);
+                }
+                continue;
+            }
+
+            const int winner = dTakeRunnerTurn(scenario, state, rng, entity);
             if (winner >= 0) {
                 return winner;
             }
         }
-
-        if (scenario.enableBudaKing && round >= scenario.budaStartRound) {
-            dFinishBudaRound(scenario, state);
-        }
     }
-    return 0;
+    return -1;
 }
 
+template <int LocalRunnerLimit>
+__device__ int dSimulateOneRace(
+    const CudaScenario& scenario,
+    DeviceRng* rng,
+    unsigned int* placements
+) {
+    DeviceRaceState state;
+    dMakeInitialState(scenario, state, rng);
+
+    int winner = dRunActiveLeg<LocalRunnerLimit>(scenario, state, rng);
+    if (winner < 0) {
+        winner = 0;
+    } else if (scenario.doubleRound) {
+        dBeginSecondLeg(scenario, state, rng);
+        winner = dRunActiveLeg<LocalRunnerLimit>(scenario, state, rng);
+        if (winner < 0) {
+            winner = 0;
+        }
+    }
+
+    dAccumulatePlacements<LocalRunnerLimit>(scenario, state, winner, placements);
+    return winner;
+}
+
+template <int LocalRunnerLimit>
 __global__ void simulateKernel(
     std::uint64_t simulations,
     std::uint32_t seed,
-    unsigned long long* wins
+    unsigned long long* placements
 ) {
+    __shared__ unsigned int blockPlacements[LocalRunnerLimit * LocalRunnerLimit];
     const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int stride = gridDim.x * blockDim.x;
+    for (int i = threadIdx.x; i < LocalRunnerLimit * LocalRunnerLimit; i += blockDim.x) {
+        blockPlacements[i] = 0;
+    }
+    __syncthreads();
 
     DeviceRng rng;
     rng.state = dSplitMix64((static_cast<unsigned long long>(seed) << 32) ^ static_cast<unsigned long long>(tid));
 
-    unsigned int localWins[kMaxRaceRunners];
-    for (int i = 0; i < kMaxRaceRunners; ++i) {
-        localWins[i] = 0;
-    }
-
     for (std::uint64_t i = tid; i < simulations; i += stride) {
-        const int winner = dSimulateOneRace(gScenario, &rng);
-        ++localWins[winner];
+        dSimulateOneRace<LocalRunnerLimit>(gScenario, &rng, blockPlacements);
     }
+    __syncthreads();
 
-    for (int r = 0; r < gScenario.runnerCount; ++r) {
-        if (localWins[r] != 0) {
-            atomicAdd(&wins[r], static_cast<unsigned long long>(localWins[r]));
+    for (int i = threadIdx.x; i < gScenario.runnerCount * gScenario.runnerCount; i += blockDim.x) {
+        const int runner = i / gScenario.runnerCount;
+        const int place = i % gScenario.runnerCount;
+        const unsigned int count = blockPlacements[runner * LocalRunnerLimit + place];
+        if (count != 0) {
+            atomicAdd(&placements[runner * kMaxRaceRunners + place], static_cast<unsigned long long>(count));
         }
     }
 }
@@ -768,30 +1174,57 @@ SimulationResult runCudaSimulation(const Scenario& scenario, const SimulationOpt
     checkCuda(cudaGetDevice(&device), "cudaGetDevice");
     cudaDeviceProp prop{};
     checkCuda(cudaGetDeviceProperties(&prop, device), "cudaGetDeviceProperties");
+    const std::size_t stackBytes = scenario.runnerCount <= kCudaSmallRunnerLimit
+        ? kCudaSmallThreadStackBytes
+        : kCudaLargeThreadStackBytes;
+    checkCuda(cudaDeviceSetLimit(cudaLimitStackSize, stackBytes), "cudaDeviceSetLimit stack");
 
     const int blocksByWork = static_cast<int>((options.simulations + kThreadsPerBlock - 1) / kThreadsPerBlock);
     const int blocksByDevice = std::max(1, prop.multiProcessorCount * kBlocksPerSm);
     const int blocks = std::max(1, std::min(blocksByWork, blocksByDevice));
 
-    unsigned long long* dWins = nullptr;
-    checkCuda(cudaMalloc(&dWins, sizeof(unsigned long long) * kMaxRaceRunners), "cudaMalloc wins");
+    unsigned long long* dPlacements = nullptr;
+    constexpr std::size_t placementCount = static_cast<std::size_t>(kMaxRaceRunners) * kMaxRaceRunners;
+    checkCuda(cudaMalloc(&dPlacements, sizeof(unsigned long long) * placementCount), "cudaMalloc placements");
     checkCuda(cudaMemcpyToSymbol(gScenario, &cudaScenario, sizeof(CudaScenario)), "cudaMemcpyToSymbol scenario");
-    checkCuda(cudaMemset(dWins, 0, sizeof(unsigned long long) * kMaxRaceRunners), "cudaMemset wins");
+    checkCuda(cudaMemset(dPlacements, 0, sizeof(unsigned long long) * placementCount), "cudaMemset placements");
 
-    simulateKernel<<<blocks, kThreadsPerBlock>>>(options.simulations, options.seed, dWins);
+    if (scenario.runnerCount <= kCudaSmallRunnerLimit) {
+        simulateKernel<kCudaSmallRunnerLimit><<<blocks, kThreadsPerBlock>>>(
+            options.simulations,
+            options.seed,
+            dPlacements
+        );
+    } else {
+        simulateKernel<kMaxRaceRunners><<<blocks, kThreadsPerBlock>>>(
+            options.simulations,
+            options.seed,
+            dPlacements
+        );
+    }
     checkCuda(cudaGetLastError(), "simulateKernel launch");
     checkCuda(cudaDeviceSynchronize(), "simulateKernel synchronize");
 
-    std::array<unsigned long long, kMaxRaceRunners> wins{};
-    checkCuda(cudaMemcpy(wins.data(), dWins, sizeof(unsigned long long) * kMaxRaceRunners, cudaMemcpyDeviceToHost), "cudaMemcpy wins");
+    std::array<unsigned long long, kMaxRaceRunners * kMaxRaceRunners> placements{};
+    checkCuda(
+        cudaMemcpy(
+            placements.data(),
+            dPlacements,
+            sizeof(unsigned long long) * placementCount,
+            cudaMemcpyDeviceToHost
+        ),
+        "cudaMemcpy placements"
+    );
 
-    cudaFree(dWins);
+    cudaFree(dPlacements);
 
     SimulationResult result;
     result.simulations = options.simulations;
     for (int i = 0; i < scenario.runnerCount; ++i) {
-        result.stats[i].wins = wins[i];
-        result.stats[i].placements[0] = wins[i];
+        for (int place = 0; place < scenario.runnerCount; ++place) {
+            result.stats[i].placements[place] = placements[i * kMaxRaceRunners + place];
+        }
+        result.stats[i].wins = result.stats[i].placements[0];
     }
     return result;
 }

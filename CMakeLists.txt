@@ -32,7 +32,6 @@ if(WUWA_ENABLE_CUDA)
     enable_language(CUDA)
     add_library(wuwa_sim_cuda src/sim_cuda.cu)
     target_include_directories(wuwa_sim_cuda PUBLIC include)
-    target_link_libraries(wuwa_sim_cuda PRIVATE wuwa_sim wuwa_compile_options)
     set_target_properties(wuwa_sim_cuda PROPERTIES
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON

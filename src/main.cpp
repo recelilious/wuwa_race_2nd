@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cctype>
 #include <ctime>
 #include <filesystem>
 #include <iomanip>
@@ -13,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #ifdef _WIN32
@@ -45,6 +47,33 @@ unsigned parseUnsigned(std::string_view text, unsigned fallback) {
     unsigned value = fallback;
     std::from_chars(text.data(), text.data() + text.size(), value);
     return value;
+}
+
+std::vector<int> parseIntList(std::string_view text) {
+    std::vector<int> values;
+    std::size_t start = 0;
+    while (start < text.size()) {
+        while (start < text.size() && (text[start] == ',' || std::isspace(static_cast<unsigned char>(text[start])))) {
+            ++start;
+        }
+        if (start >= text.size()) {
+            break;
+        }
+
+        std::size_t end = start;
+        while (end < text.size() && text[end] != ',' && !std::isspace(static_cast<unsigned char>(text[end]))) {
+            ++end;
+        }
+
+        int value = 0;
+        const auto result = std::from_chars(text.data() + start, text.data() + end, value);
+        if (result.ec != std::errc{} || result.ptr != text.data() + end) {
+            throw std::runtime_error("runner list must contain integer ids separated by comma or space");
+        }
+        values.push_back(value);
+        start = end;
+    }
+    return values;
 }
 
 double parseDouble(const char* text, double fallback) {
@@ -164,7 +193,12 @@ void printRanking(const wuwa::Scenario& scenario, const wuwa::SimulationResult& 
     std::cout << std::left << std::setw(6) << "Rank"
               << std::setw(24) << "Runner"
               << std::right << std::setw(14) << "Wins"
-              << std::setw(12) << "Win%" << "\n";
+              << std::setw(12) << "Win%";
+    for (int place = 0; place < scenario.runnerCount; ++place) {
+        const std::string label = "P" + std::to_string(place + 1) + "%";
+        std::cout << std::setw(9) << label;
+    }
+    std::cout << "\n";
 
     for (int rank = 0; rank < scenario.runnerCount; ++rank) {
         const int runner = order[rank];
@@ -175,7 +209,14 @@ void printRanking(const wuwa::Scenario& scenario, const wuwa::SimulationResult& 
         std::cout << std::left << std::setw(6) << (rank + 1)
                   << std::setw(24) << scenario.runners[runner].name
                   << std::right << std::setw(14) << stats.wins
-                  << std::setw(11) << std::fixed << std::setprecision(3) << winPct << "%\n";
+                  << std::setw(11) << std::fixed << std::setprecision(3) << winPct << "%";
+        for (int place = 0; place < scenario.runnerCount; ++place) {
+            const double placePct = denom == 0.0
+                ? 0.0
+                : 100.0 * static_cast<double>(stats.placements[place]) / denom;
+            std::cout << std::setw(8) << std::fixed << std::setprecision(3) << placePct << "%";
+        }
+        std::cout << "\n";
     }
 }
 
@@ -252,6 +293,7 @@ int main(int argc, char** argv) {
         wuwa::SimulationOptions options;
         std::string mapPath;
         std::string namesPath;
+        std::string runnersArg;
         int startIndexOverride = -1;
         std::string traceOut;
         bool useCuda = false;
@@ -270,6 +312,8 @@ int main(int argc, char** argv) {
                 mapPath = argv[++i];
             } else if (arg == "--names" && i + 1 < argc) {
                 namesPath = argv[++i];
+            } else if (arg == "--runners" && i + 1 < argc) {
+                runnersArg = argv[++i];
             } else if (arg == "--start-index" && i + 1 < argc) {
                 startIndexOverride = static_cast<int>(parseUnsigned(argv[++i], 0));
             } else if (arg == "--trace-out" && i + 1 < argc) {
@@ -300,6 +344,13 @@ int main(int argc, char** argv) {
         }
 
         wuwa::Scenario scenario = wuwa::makeExampleScenario();
+        if (!runnersArg.empty()) {
+            const std::vector<int> runnerIds = parseIntList(runnersArg);
+            if (runnerIds.size() != 6) {
+                throw std::runtime_error("--runners currently expects exactly 6 runner ids");
+            }
+            wuwa::setScenarioRunners(scenario, runnerIds);
+        }
         if (!mapPath.empty()) {
             wuwa::loadTrackFile(scenario, mapPath);
             scenario.name = mapPath;
@@ -321,6 +372,10 @@ int main(int argc, char** argv) {
         std::cout << "\n";
         std::cout << "Backend: " << (useCuda ? "CUDA" : "CPU") << "\n";
         std::cout << "Scenario: " << scenario.name << "\n";
+        if (scenario.doubleRound) {
+            std::cout << "Race mode: double-round (" << scenario.firstFinishIndex
+                      << " -> " << scenario.secondFinishIndex << ")\n";
+        }
         std::cout << "Simulations: " << result.simulations << "\n\n";
         std::cout << "Seed: " << options.seed << (seedProvided ? " (explicit)" : " (auto)") << "\n\n";
         printRanking(scenario, result);
